@@ -1,0 +1,59 @@
+.TH SIGROK\-FWEXTRACT\-INTRONIX\-LOGICPORT 1 "October 18, 2026"
+.SH "NAME"
+sigrok\-fwextract\-intronix\-logicport \- Extract Intronix LogicPort bitstreams
+.SH "SYNOPSIS"
+.B sigrok\-fwextract\-intronix\-logicport FILE
+.SH "DESCRIPTION"
+This tool extracts the FPGA bitstreams for the Intronix LogicPort LA1034
+USB logic analyzer from the vendor software. The FPGA is volatile and gets
+configured by the libsigrok driver with one of eight bitstreams, depending
+on the sampling mode (timing SDR, timing DDR at 500MHz, and several state
+mode variants).
+.PP
+The bitstreams ship in a file called "LogicPort.ccf", which the vendor's
+Windows installer [1] puts into the LogicPort program directory. To
+extract the bitstreams, run:
+.PP
+.B "  $ sigrok-fwextract-intronix-logicport LogicPort.ccf"
+.br
+.RB "  saved 66115 bytes to intronix-logicport-state-after.rbf (crc32 fb28768e)"
+.br
+.RB "  saved 65282 bytes to intronix-logicport-state-before-clk1-rise.rbf (crc32 a079b32c)"
+.br
+.RB "  saved 65431 bytes to intronix-logicport-state-before-clk2-rise.rbf (crc32 5664f7d7)"
+.br
+.RB "  saved 65458 bytes to intronix-logicport-state-before-clk1-fall.rbf (crc32 e344d08b)"
+.br
+.RB "  saved 65407 bytes to intronix-logicport-state-before-clk2-fall.rbf (crc32 bdc060a8)"
+.br
+.RB "  saved 65937 bytes to intronix-logicport-state-on.rbf (crc32 832c3e3f)"
+.br
+.RB "  saved 64452 bytes to intronix-logicport-timing-ddr.rbf (crc32 ece870e6)"
+.br
+.RB "  saved 66149 bytes to intronix-logicport-timing-sdr.rbf (crc32 70a7a41d)"
+.PP
+The output above is for LogicPort software build 2371. Copy the resulting
+files to the location where libsigrok expects to find firmware files.
+By default this is /usr/local/share/sigrok\-firmware.
+.SH OPTIONS
+None.
+.SH "EXIT STATUS"
+Exits with 0 on success, 1 on most failures.
+.SH "SEE ALSO"
+\fBsigrok\-fwextract\-kingst\-la2016\fP(1),
+\fBsigrok\-fwextract\-sysclk\-lwla1016\fP(1)
+.SH "BUGS"
+Please report any bugs via Bugzilla
+.RB "(" http://sigrok.org/bugzilla/ ")"
+or on the sigrok\-devel mailing list
+.RB "(" sigrok\-devel@lists.sourceforge.net ")."
+.SH "LICENSE"
+This program is covered by the GNU General Public License (GPL),
+version 3 or later.
+.SH "AUTHORS"
+Please see the individual source code files.
+.PP
+This manual page was written by Miguel Angel Ajo Pelayo.
+It is licensed under the terms of the GNU GPL (version 3 or later).
+.SH "REFERENCES"
+[1] https://www.pctestinstruments.com/downloads/logicport_2371.exe
