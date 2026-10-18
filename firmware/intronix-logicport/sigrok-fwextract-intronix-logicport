@@ -18,10 +18,9 @@
 ## along with this program; if not, see <http://www.gnu.org/licenses/>.
 ##
 
-"""Extract the Intronix LogicPort LA1034 FPGA bitstreams from the vendor software."""
+"""Get LogicPort.ccf (the Intronix LogicPort LA1034 FPGA bitstreams) from the vendor software."""
 
 import argparse
-import binascii
 import hashlib
 import os
 import shutil
@@ -38,17 +37,8 @@ KNOWN = {
     '9298a5eacb3cf1a791b8ce48460a19e031eb81baffa378bab3f94f2d78483f9c': 'LogicPort.ccf (build 2371)',
 }
 
-# Image index in LogicPort.ccf -> output file name.
-NAMES = [
-    'intronix-logicport-state-after.rbf',
-    'intronix-logicport-state-before-clk1-rise.rbf',
-    'intronix-logicport-state-before-clk2-rise.rbf',
-    'intronix-logicport-state-before-clk1-fall.rbf',
-    'intronix-logicport-state-before-clk2-fall.rbf',
-    'intronix-logicport-state-on.rbf',
-    'intronix-logicport-timing-ddr.rbf',
-    'intronix-logicport-timing-sdr.rbf',
-]
+# The driver loads LogicPort.ccf unmodified, under this name.
+OUTPUT = 'intronix-logicport.ccf'
 
 ENTRY_MAGIC = b'LS\x03\x04'
 
@@ -103,40 +93,34 @@ def ccf_from_installer(exe, tmpdir):
         return f.read()
 
 
-def extract(data):
+def check_ccf(data):
     # Header: image sizes in 16 byte units, XOR obfuscated, plus a checksum.
-    eol = data.index(b'\r\n')
-    lens = [int(x) ^ 0x916662 for x in data[:eol].decode('ascii').split(',')]
-    if len(lens) != 9:
-        die('Unexpected header.')
+    eol = data.find(b'\r\n')
+    try:
+        lens = [int(x) ^ 0x916662 for x in data[:eol].decode('ascii').split(',')]
+    except ValueError:
+        die('Not a LogicPort.ccf file.')
+    if eol < 0 or len(lens) != 9:
+        die('Not a LogicPort.ccf file.')
     chk = 0
     for v in lens[:8]:
         chk ^= v
     if chk != lens[8]:
         die('Header checksum mismatch.')
+    if eol + 2 + sum(lens[:8]) * 16 != len(data):
+        die('Unexpected file size.')
 
+    # Each image is a bit-bang stream (two bytes per bit, data in bit 0)
+    # with its first two 4 KiB blocks swapped. Check for an RBF header.
     off = eol + 2
-    images = []
-    for v in lens[:8]:
+    for i, v in enumerate(lens[:8]):
         seg = bytearray(data[off:off + v * 16])
         off += v * 16
-        # The first two 4 KiB blocks of each image are swapped.
         seg[0:4096], seg[4096:8192] = seg[4096:8192], seg[0:4096]
-        # Bit-bang stream: two bytes per bit, data in bit 0, nCONFIG (bit 2) high.
-        if any(b & 0xf8 or not b & 4 for b in seg):
-            die('Unexpected bit-bang stream content.')
-        bits = seg[0::2]
-        rbf = bytearray(len(bits) // 8)
-        for i in range(len(rbf)):
-            b = 0
-            for j in range(8):
-                b |= (bits[i * 8 + j] & 1) << j
-            rbf[i] = b
-        images.append(bytes(rbf))
-    if off != len(data):
-        die('Trailing data in file.')
-
-    return images
+        head = bytes(sum((seg[(b * 8 + k) * 2] & 1) << k for k in range(8))
+                     for b in range(17))
+        if head != b'\xff' * 16 + b'\x6a':
+            die('Image %d is not an Altera bitstream.' % i)
 
 
 def main():
@@ -164,16 +148,13 @@ def main():
             check_known(data, 'installer')
             data = ccf_from_installer(data, tmpdir)
         check_known(data, 'LogicPort.ccf')
-        images = extract(data)
+        check_ccf(data)
 
     os.makedirs(args.output_dir, exist_ok=True)
-    for name, rbf in zip(NAMES, images):
-        if not rbf.startswith(b'\xff' * 16 + b'\x6a'):
-            die('%s does not look like an Altera RBF.' % name)
-        with open(os.path.join(args.output_dir, name), 'wb') as f:
-            f.write(rbf)
-        print('saved %d bytes to %s (crc32 %08x)' %
-              (len(rbf), name, binascii.crc32(rbf) & 0xffffffff))
+    with open(os.path.join(args.output_dir, OUTPUT), 'wb') as f:
+        f.write(data)
+    print('saved %d bytes to %s (sha256 %s)' %
+          (len(data), OUTPUT, hashlib.sha256(data).hexdigest()))
 
 
 main()
