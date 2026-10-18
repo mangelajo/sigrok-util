@@ -18,62 +18,112 @@
 ## along with this program; if not, see <http://www.gnu.org/licenses/>.
 ##
 
-"""Extract the FPGA bitstreams for the Intronix LogicPort LA1034 from the
-vendor's LogicPort.ccf file (installed with the LogicPort software).
+"""Extract the Intronix LogicPort LA1034 FPGA bitstreams from the vendor software."""
 
-LogicPort.ccf layout:
-  * first line (CRLF terminated): comma separated decimal numbers N0..N8;
-    len_k = N_k ^ 0x916662 is the size of image k in units of 16 bytes,
-    N8 ^ 0x916662 is the XOR of len_0..len_7 (checksum).
-  * 8 images follow, back to back. Each is an FT245 async bit-bang stream:
-    one configuration bit per byte pair (DCLK low, DCLK high), bit0 = DATA0,
-    bit1 = DCLK, bit2 = nCONFIG. In every image the first two 4 KiB blocks
-    are swapped.
-This script undoes the block swap and packs the data bits (LSB first) into
-plain Altera raw binary files (.rbf), which the libsigrok driver bit-bangs.
-"""
+import argparse
+import binascii
+import hashlib
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import urllib.request
 
-import sys, os, hashlib, binascii
-
-# Image index in LogicPort.ccf -> output file name.
-NAMES = {
-    0: 'intronix-logicport-state-after.rbf',          # state mode, sample 2.5ns after edge
-    1: 'intronix-logicport-state-before-clk1-rise.rbf',
-    2: 'intronix-logicport-state-before-clk2-rise.rbf',
-    3: 'intronix-logicport-state-before-clk1-fall.rbf',
-    4: 'intronix-logicport-state-before-clk2-fall.rbf',
-    5: 'intronix-logicport-state-on.rbf',             # state mode, sample on edge
-    6: 'intronix-logicport-timing-ddr.rbf',           # timing mode, 500 MHz
-    7: 'intronix-logicport-timing-sdr.rbf',           # timing mode, <= 250 MHz
-}
+URL = 'https://www.pctestinstruments.com/downloads/logicport_2371.exe'
 
 KNOWN = {
-    # sha256 of LogicPort.ccf as shipped in logicport_2371.exe (build 2371)
-    '9298a5eacb3cf1a791b8ce48460a19e031eb81baffa378bab3f94f2d78483f9c': 'build 2371',
+    '4943568f001a481250dd73ce9d841de73b274c0f93d0897f3c7adc222f811d0c': 'logicport_2371.exe',
+    '9298a5eacb3cf1a791b8ce48460a19e031eb81baffa378bab3f94f2d78483f9c': 'LogicPort.ccf (build 2371)',
 }
+
+# Image index in LogicPort.ccf -> output file name.
+NAMES = [
+    'intronix-logicport-state-after.rbf',
+    'intronix-logicport-state-before-clk1-rise.rbf',
+    'intronix-logicport-state-before-clk2-rise.rbf',
+    'intronix-logicport-state-before-clk1-fall.rbf',
+    'intronix-logicport-state-before-clk2-fall.rbf',
+    'intronix-logicport-state-on.rbf',
+    'intronix-logicport-timing-ddr.rbf',
+    'intronix-logicport-timing-sdr.rbf',
+]
+
+ENTRY_MAGIC = b'LS\x03\x04'
+
 
 def die(msg):
     print(msg, file=sys.stderr)
     sys.exit(1)
 
+
+def check_known(data, what):
+    digest = hashlib.sha256(data).hexdigest()
+    if digest not in KNOWN:
+        print('Warning: unknown %s (sha256 %s), trying anyway.' % (what, digest))
+
+
+def ccf_from_installer(exe, tmpdir):
+    # Find the LogicPort.ccf entry in the installer payload. It is Deflate64
+    # compressed, which Python can't inflate, so repack it as a one entry
+    # ZIP file and let 7-Zip decompress it.
+    i = exe.find(ENTRY_MAGIC)
+    while i >= 0 and exe[i:i + 4] == ENTRY_MAGIC:
+        method, = struct.unpack_from('<H', exe, i + 0x08)
+        crc, csize, usize = struct.unpack_from('<III', exe, i + 0x26)
+        namelen, = struct.unpack_from('<I', exe, i + 0x3a)
+        name = exe[i + 0x3e:i + 0x3e + namelen].decode('latin1')
+        body = i + 0x3e + namelen
+        if name.lower().endswith('.ccf'):
+            break
+        i = body + csize
+    else:
+        die('No LogicPort.ccf found in the installer.')
+
+    fname = b'LogicPort.ccf'
+    local = struct.pack('<IHHHHHIIIHH', 0x04034b50, 21, 0, method, 0, 0x21,
+                        crc, csize, usize, len(fname), 0) + fname
+    central = struct.pack('<IHHHHHHIIIHHHHHII', 0x02014b50, 21, 21, 0, method,
+                          0, 0x21, crc, csize, usize, len(fname), 0, 0, 0, 0,
+                          0, 0) + fname
+    offset = len(local) + csize
+    end = struct.pack('<IHHHHIIH', 0x06054b50, 0, 0, 1, 1, len(central),
+                      offset, 0)
+    zippath = os.path.join(tmpdir, 'ccf.zip')
+    with open(zippath, 'wb') as f:
+        f.write(local + exe[body:body + csize] + central + end)
+
+    sevenzip = next((c for c in ('7zz', '7z', '7za') if shutil.which(c)), None)
+    if not sevenzip:
+        die('7-Zip (7zz, 7z or 7za) is needed to decompress the installer.')
+    subprocess.run([sevenzip, 'x', '-y', '-o' + tmpdir, zippath], check=True,
+                   stdout=subprocess.DEVNULL)
+    with open(os.path.join(tmpdir, 'LogicPort.ccf'), 'rb') as f:
+        return f.read()
+
+
 def extract(data):
+    # Header: image sizes in 16 byte units, XOR obfuscated, plus a checksum.
     eol = data.index(b'\r\n')
-    nums = [int(x) for x in data[:eol].decode('ascii').split(',')]
-    if len(nums) != 9:
+    lens = [int(x) ^ 0x916662 for x in data[:eol].decode('ascii').split(',')]
+    if len(lens) != 9:
         die('Unexpected header.')
-    lens = [n ^ 0x916662 for n in nums]
     chk = 0
     for v in lens[:8]:
         chk ^= v
     if chk != lens[8]:
         die('Header checksum mismatch.')
+
     off = eol + 2
     images = []
     for v in lens[:8]:
         seg = bytearray(data[off:off + v * 16])
-        seg[0:4096], seg[4096:8192] = seg[4096:8192], seg[0:4096]
         off += v * 16
-        if any(b & 0xf8 != 0 or not b & 4 for b in seg):
+        # The first two 4 KiB blocks of each image are swapped.
+        seg[0:4096], seg[4096:8192] = seg[4096:8192], seg[0:4096]
+        # Bit-bang stream: two bytes per bit, data in bit 0, nCONFIG (bit 2) high.
+        if any(b & 0xf8 or not b & 4 for b in seg):
             die('Unexpected bit-bang stream content.')
         bits = seg[0::2]
         rbf = bytearray(len(bits) // 8)
@@ -85,20 +135,45 @@ def extract(data):
         images.append(bytes(rbf))
     if off != len(data):
         die('Trailing data in file.')
+
     return images
 
+
 def main():
-    if len(sys.argv) != 2:
-        die('Usage: %s <path/to/LogicPort.ccf>' % os.path.basename(sys.argv[0]))
-    data = open(sys.argv[1], 'rb').read()
-    digest = hashlib.sha256(data).hexdigest()
-    if digest not in KNOWN:
-        print('Warning: unknown LogicPort.ccf (sha256 %s); trying anyway.' % digest)
-    for i, rbf in enumerate(extract(data)):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('file', nargs='?',
+                        help='LogicPort.ccf, or the vendor installer (logicport_*.exe)')
+    parser.add_argument('-d', '--download', action='store_true',
+                        help='download the vendor installer from ' + URL)
+    parser.add_argument('-o', '--output-dir', default='.',
+                        help='where to write the files (default: current directory)')
+    args = parser.parse_args()
+    if bool(args.file) == args.download:
+        parser.error('give either a FILE or --download')
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        if args.download:
+            path = os.path.join(tmpdir, os.path.basename(URL))
+            print('Downloading %s' % URL)
+            urllib.request.urlretrieve(URL, path)
+        else:
+            path = args.file
+        with open(path, 'rb') as f:
+            data = f.read()
+        if data[:2] == b'MZ':
+            check_known(data, 'installer')
+            data = ccf_from_installer(data, tmpdir)
+        check_known(data, 'LogicPort.ccf')
+        images = extract(data)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    for name, rbf in zip(NAMES, images):
         if not rbf.startswith(b'\xff' * 16 + b'\x6a'):
-            die('Image %d does not look like an Altera RBF.' % i)
-        with open(NAMES[i], 'wb') as f:
+            die('%s does not look like an Altera RBF.' % name)
+        with open(os.path.join(args.output_dir, name), 'wb') as f:
             f.write(rbf)
-        print('saved %d bytes to %s (crc32 %08x)' % (len(rbf), NAMES[i], binascii.crc32(rbf) & 0xffffffff))
+        print('saved %d bytes to %s (crc32 %08x)' %
+              (len(rbf), name, binascii.crc32(rbf) & 0xffffffff))
+
 
 main()
